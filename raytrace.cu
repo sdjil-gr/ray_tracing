@@ -8,11 +8,11 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb/stb_image_write.h"
 
-#define IMAGE_WIDTH 1
-#define IMAGE_HEIGHT 1
-#define SAMP 32
-#define SUBPIX 4
-#define MAX_DEPTH 8
+#define IMAGE_WIDTH 320
+#define IMAGE_HEIGHT 320
+#define SAMP 2048
+#define SUBPIX 8
+#define MAX_DEPTH 4
 
 #define MAX_BALL_COUNT 50
 
@@ -68,9 +68,9 @@ struct Sphere {
 
     Sphere(glm::vec3 p, float r, glm::vec3 rgb, float ref, float rou, glm::vec3 ems) 
         : pos(p), radius(r), rgb(rgb), reflectance(ref), roughness(rou), emission(ems) {
-            specular = reflectance * (1.0f - roughness);
+            specular = reflectance * (1.0 - roughness);
             diffuse = reflectance * roughness;
-            refact = 1 - reflectance;
+            refact = 1.0 - reflectance;
     }
 
     Sphere() {}
@@ -106,13 +106,13 @@ struct Sphere {
     // lambertian diffuse
     __device__ glm::vec3 lambertian_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
         wo = cos_sample_hemisphere(state, normal);
-        return rgb * diffuse;
+        return rgb;
     }
 
     // specular
     __device__ glm::vec3 specular_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
         wo = glm::reflect(wi, normal);
-        return rgb * specular;
+        return rgb;
     }
 
     // refraction
@@ -122,11 +122,11 @@ struct Sphere {
 
     /**
      * @brief mixture of brdf
-     * @return fr / pdf
+     * @return cos(theta) * fr / pdf
     */
     __device__ glm::vec3 brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
-      float r1 = curand_uniform_double(state);
-       if(r1 < refact)
+        float r1 = curand_uniform_double(state);
+        if(r1 < refact)
             return refraction_brdf(state, wi, wo, normal, inside);
         else if (r1 < refact + diffuse)
             return lambertian_brdf(state, wi, wo, normal, inside);
@@ -139,34 +139,32 @@ __constant__ Sphere spheres[MAX_BALL_COUNT];
 __constant__ int sphere_count;
 
 __device__ glm::vec3 shade(curandStateXORWOW_t* state, const glm::vec3& pos, const glm::vec3& ray, int depth){
-    float t = 1e30f;
-    glm::vec3 normal;
-    int inside;
-    if (depth == 3)
-        printf ("depth == 3\n");
-    Sphere* hit_sphere = nullptr;
-    for(int i = 0; i < sphere_count; i++) {
-        if(spheres[i].hit(pos, ray, t, normal, inside))
-            hit_sphere = &spheres[i];
-    }
-    if(hit_sphere == nullptr){
-        printf("No hit\n");
-        return glm::vec3(0.0f, 0.0f, 0.0f);
-    }
-    Sphere& s = *hit_sphere;
-    if(depth <= 0)
-        return s.emission;
+    glm::vec3 now_pos = pos;
+    glm::vec3 now_ray = ray;
 
-    glm::vec3 wo;
-    glm::vec3 brdf = s.brdf(state, ray, wo, normal, inside);
-    glm::vec3 hit_pos = pos + ray * t + 0.03f * normal;
+    glm::vec3 col(0.0f, 0.0f, 0.0f);
+    glm::vec3 mul_value(1.0f, 1.0f, 1.0f);
 
-    printf("depth : %d\n", depth);
-    printf("hit_pos: %f %f %f\n", hit_pos.x, hit_pos.y, hit_pos.z);
-    printf("wo: %f %f %f\n", wo.x, wo.y, wo.z);
-    auto result = shade(state, hit_pos, wo, depth - 1);
-    printf("result: %f %f %f\n", result.x, result.y, result.z);
-    return s.emission + brdf * result;
+    for(int i = depth; i >=0; i--){
+        float t = 1e30f;
+        glm::vec3 normal;
+        int inside;
+
+        Sphere* hit_sphere = nullptr;
+        for(int i = 0; i < sphere_count; i++) {
+            if(spheres[i].hit(now_pos, now_ray, t, normal, inside))
+                hit_sphere = &spheres[i];
+        }
+        if(hit_sphere == nullptr)
+            return col;
+        Sphere& s = *hit_sphere;
+        if(depth <= 0)
+            return col + mul_value * s.emission;
+        now_pos = now_pos + now_ray * t + 0.03f * normal;
+        col += mul_value * s.emission;
+        mul_value *= s.brdf(state, now_ray, now_ray, normal, inside);
+    }
+    return col;
 }
 
 __global__ void render(curandStateXORWOW_t* states, unsigned char* image, int width, int height, int samples_per_pixel) {
@@ -192,9 +190,6 @@ __global__ void render(curandStateXORWOW_t* states, unsigned char* image, int wi
             col += shade(&states[index], pos, samp_ray, MAX_DEPTH) / (float)samples_per_pixel / (float)SUBPIX;
         }
     }
-
-    // printf("aaaaaa");
-
 
     glm::vec3 rgb = 255.99f * glm::clamp(col, 0.0f, 1.0f);
 
@@ -256,7 +251,7 @@ void init_spheres(){
         Sphere(glm::vec3(40.8, 1e5, 81.6), 1e5, glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Bottom
         Sphere(glm::vec3(40.8, -1e5 + 81.6, 81.6), 1e5, glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Top
         Sphere(glm::vec3(27, 16, 48), 16, glm::vec3(1.0, 1.0, 1.0), 1.0, 0.8, glm::vec3(0.0, 0.0, 0.0)), // sphere1
-        Sphere(glm::vec3(56, 16, 74), 16, glm::vec3(0.10, 1.0, 0.10), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere2
+        Sphere(glm::vec3(56, 16, 74), 16, glm::vec3(0.10, 0.7, 0.10), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere2
         Sphere(glm::vec3(40.8, 681.6 - 0.16, 81.6), 600, glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(24, 24, 24)) // Light
     };
     int sphere_count_host = sizeof(spheres_host) / sizeof(Sphere);
@@ -270,10 +265,10 @@ int main() {
     int samples_per_pixel = SAMP;
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDAErrorCheck(cudaEventCreate(&start));
+    CUDAErrorCheck(cudaEventCreate(&stop));
 
-    cudaEventRecord(start, 0);
+    CUDAErrorCheck(cudaEventRecord(start, 0));
 
     init_camera();
 
@@ -294,29 +289,30 @@ int main() {
 
 #ifdef GENERATE_GAUSS
     unsigned char* gauss_image;
-    cudaMalloc(&gauss_image, width * height * 3);
+    CUDAErrorCheck(cudaMalloc(&gauss_image, width * height * 3));
 
     dim3 block_size_gauss(16, 16);
     dim3 grid_size_gauss(width / 16, height/ 16);
     gauss_blur<<<grid_size_gauss, block_size_gauss>>>(gauss_image, image, width, height);
     cudaDeviceSynchronize();
+    CUDAErrorCheck(cudaGetLastError());
 
 
     unsigned char* gauss_image_host = (unsigned char*)malloc(width * height * 3);
-    cudaMemcpy(gauss_image_host, gauss_image, width * height * 3, cudaMemcpyDeviceToHost);
-    cudaFree(gauss_image);
+    CUDAErrorCheck(cudaMemcpy(gauss_image_host, gauss_image, width * height * 3, cudaMemcpyDeviceToHost));
+    CUDAErrorCheck(cudaFree(gauss_image));
 #endif
     unsigned char* image_host = (unsigned char*)malloc(width * height * 3);
-    cudaMemcpy(image_host, image, width * height * 3, cudaMemcpyDeviceToHost);
-    cudaFree(image);
+    CUDAErrorCheck(cudaMemcpy(image_host, image, width * height * 3, cudaMemcpyDeviceToHost));
+    CUDAErrorCheck(cudaFree(image));
 
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
+    CUDAErrorCheck(cudaEventRecord(stop, 0));
+    CUDAErrorCheck(cudaEventSynchronize(stop));
     float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    CUDAErrorCheck(cudaEventElapsedTime(&milliseconds, start, stop));
     printf("Time: %.3f ms\n", milliseconds);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    CUDAErrorCheck(cudaEventDestroy(start));
+    CUDAErrorCheck(cudaEventDestroy(stop));
 
     stbi_write_png("image.png", width, height, 3, image_host, width * 3);
     free(image_host);
