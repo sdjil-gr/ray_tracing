@@ -9,11 +9,11 @@
 
 #define IMAGE_WIDTH 640
 #define IMAGE_HEIGHT 640
-#define SAMP 64
-#define SUBPIX 4
-#define MAX_DEPTH 6
+#define SAMP 412
+#define SUBPIX 8
+#define MAX_DEPTH 16
 
-#define MAX_BALL_COUNT 50
+#define MAX_ITEM_COUNT 50
 
 #define CUDAErrorCheck(ans) { cudaError_t error = ans; if (error != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(error)); exit(error); } }
 
@@ -70,6 +70,8 @@ public:
     glm::vec3 rgb;
     glm::vec3 emission;
 
+    __host__ __device__ item() {}
+
     __device__ int hit(const glm::vec3& o, const glm::vec3& d, float& t, glm::vec3& normal, int& inside);
     __device__ glm::vec3 brdf(curandStateXORWOW_t* state, const glm::vec3& wi, glm::vec3& wo, const glm::vec3& normal, const int& inside);
 };
@@ -77,24 +79,21 @@ public:
 class Sphere : public item {
     glm::vec3 pos;
     float radius;
-    float reflectance;//反射率
+
+    float reflectance;//基础反射率
     float roughness;//粗糙度
 
-    float refract_index;//折射率
-
-    float specular;//反射占比
-    float diffuse;//散射占比
-    float refact;//折射占比
+    float refac_index;//折射率
 
 public:
-    glm::vec3 rgb;
-    glm::vec3 emission;
-
-    Sphere(glm::vec3 p, float r, glm::vec3 rgb, float ref, float rou, glm::vec3 ems) 
-        : pos(p), radius(r), rgb(rgb), reflectance(ref), roughness(rou), emission(ems) {
-            specular = reflectance * (1.0 - roughness);
-            diffuse = reflectance * roughness;
-            refact = 1.0 - reflectance;
+    Sphere(glm::vec3 p, float r, glm::vec3 RGB, float ref, float rou, glm::vec3 ems) 
+        : item(), pos(p), radius(r), reflectance(ref), roughness(rou){
+            rgb = RGB;
+            emission = ems;
+            if(ref >= 1.0)
+                refac_index = 1e30f;
+            else
+                refac_index = (1.0f + std::sqrt(ref)) /(1.0f - std::sqrt(ref));
     }
 
     Sphere() {}
@@ -116,11 +115,11 @@ public:
         float thc = sqrtf(radius * radius - dr);
         if(ins)
             thc = -thc;
-        if(tp - thc > t)
+        if(tp - thc >= t)
             return 0;
         t = tp - thc;
         normal = glm::normalize(d * t - oc);
-        assert(normal.x == normal.x && normal.y == normal.y && normal.z == normal.z);
+        // assert(normal.x == normal.x && normal.y == normal.y && normal.z == normal.z);
         if(ins)
             normal = -normal;
         inside = ins;
@@ -141,7 +140,18 @@ public:
 
     // refraction
     __device__ glm::vec3 refraction_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
-        return glm::vec3(0.0f, 0.0f, 0.0f);
+        float cos_theta_i = -glm::dot(wi, normal);
+        float sin_theta_i = glm::sqrt(1.0 - cos_theta_i * cos_theta_i);
+        float sin_theta_t;
+        if(inside)
+            sin_theta_t = sin_theta_i * refac_index;
+        else
+            sin_theta_t = sin_theta_i / refac_index;
+        float cos_theta_t = glm::sqrt(1.0 - sin_theta_t * sin_theta_t);
+        if(sin_theta_t > 1.0)
+            return specular_brdf(state, wi, wo, normal, inside);
+        wo = glm::normalize(wi + normal * (cos_theta_i - sin_theta_i / sin_theta_t * cos_theta_t));
+        return glm::vec3(1.0f, 1.0f, 1.0f) ;
     }
 
     /**
@@ -154,18 +164,117 @@ public:
      * @return cos(theta) * fr / pdf
     */
     __device__ glm::vec3 brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
-        float r1 = curand_uniform_double(state);
-        if(r1 < refact)
+        float cos_theta = -glm::dot(wi, normal);
+        float Fr = reflectance + (1.0 - reflectance) * powf((1.0 - cos_theta), 5.0);
+        float r = curand_uniform_double(state);
+        if(r < Fr){
+            if(r < Fr * roughness)
+                return lambertian_brdf(state, wi, wo, normal, inside);
+            else
+                return specular_brdf(state, wi, wo, normal, inside);
+        } else
             return refraction_brdf(state, wi, wo, normal, inside);
-        else if (r1 < refact + diffuse)
-            return lambertian_brdf(state, wi, wo, normal, inside);
-        else
-            return specular_brdf(state, wi, wo, normal, inside);
     }
 };
 
-__constant__ Sphere spheres[MAX_BALL_COUNT];
+class plane : public item {
+    glm::vec3 pos;
+    glm::vec3 n;
+
+    float reflectance;//基础反射率
+    float roughness;//粗糙度
+
+    float refac_index;//折射率
+
+
+public:
+    int type;//为1开启纹理
+
+    plane(glm::vec3 p, glm::vec3 n, glm::vec3 RGB, float ref, float rou, glm::vec3 ems) 
+        : item(), pos(p), n(glm::normalize(n)), reflectance(ref), roughness(rou){
+            rgb = RGB;
+            emission = ems;
+            if(ref >= 1.0)
+                refac_index = 1e30f;
+            else
+                refac_index = (1.0f + std::sqrt(ref)) /(1.0f - std::sqrt(ref));
+    }
+
+    plane() {}
+
+    __device__ int hit(const glm::vec3& o, const glm::vec3& d, float& t, glm::vec3& normal, int& inside) const {
+        glm::vec3 nor = n;
+        int ins = 0;
+        if(glm::dot(nor, pos - o) > 0.0f){
+            nor = -nor;
+            ins = 1;
+        }
+        
+        float cos_theta = -glm::dot(d, nor);
+        if(cos_theta <= 0.0f) // 不会命中
+            return 0;
+        float new_t = glm::dot(o - pos, nor) / cos_theta;
+        if(new_t >= t)
+            return 0;
+
+        t = new_t;
+        normal = nor;
+        inside = ins;
+        if(type == 1){//wave
+            glm::vec3 dx = glm::vec3(0.1f, 0.0f, 0.0f) * (float)sin((o + d*t).x / 2.0f * M_PI / 5.0f);
+            glm::vec3 dy = glm::vec3(0.0f, 0.1f, 0.0f) * (float)sin((o + d*t).y / 2.0f * M_PI / 5.0f);
+            glm::vec3 dz = glm::vec3(0.0f, 0.0f, 0.1f) * (float)sin((o + d*t).z / 2.0f * M_PI / 5.0f);
+            normal = glm::normalize(nor + dx + dy + dz);
+        }
+        return 1;
+    }
+
+    // lambertian diffuse
+    __device__ glm::vec3 lambertian_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
+        wo = cos_sample_hemisphere(state, normal);
+        return rgb;
+    }
+
+    // specular
+    __device__ glm::vec3 specular_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
+        wo = glm::reflect(wi, normal);
+        return rgb;
+    }
+
+    // refraction
+    __device__ glm::vec3 refraction_brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
+        float cos_theta_i = -glm::dot(wi, normal);
+        float sin_theta_i = glm::sqrt(1.0 - cos_theta_i * cos_theta_i);
+        float sin_theta_t;
+        if(inside)
+            sin_theta_t = sin_theta_i * refac_index;
+        else
+            sin_theta_t = sin_theta_i / refac_index;
+        float cos_theta_t = glm::sqrt(1.0 - sin_theta_t * sin_theta_t);
+        if(sin_theta_t > 1.0)
+            return specular_brdf(state, wi, wo, normal, inside);
+        wo = glm::normalize(wi + normal * (cos_theta_i - sin_theta_i / sin_theta_t * cos_theta_t));
+        return glm::vec3(1.0f, 1.0f, 1.0f) ;
+    }
+
+    __device__ glm::vec3 brdf(curandStateXORWOW_t* state, const glm::vec3 &wi, glm::vec3& wo, const glm::vec3& normal, const int &inside) const {
+        float cos_theta = -glm::dot(wi, normal);
+        float Fr = reflectance + (1.0 - reflectance) * powf((1.0 - cos_theta), 5.0);
+        float r = curand_uniform_double(state);
+        if(r < Fr){
+            if(r < Fr * roughness)
+                return lambertian_brdf(state, wi, wo, normal, inside);
+            else
+                return specular_brdf(state, wi, wo, normal, inside);
+        } else
+            return refraction_brdf(state, wi, wo, normal, inside);
+    }
+};
+
+__constant__ Sphere spheres[MAX_ITEM_COUNT];
 __constant__ int sphere_count;
+__constant__ plane planes[MAX_ITEM_COUNT];
+__constant__ int plane_count;
 
 /**
  * @brief shade for ray
@@ -187,19 +296,36 @@ __device__ glm::vec3 shade(curandStateXORWOW_t* state, const glm::vec3& pos, con
         glm::vec3 normal;
         int inside;
 
-        Sphere* hit_sphere = nullptr;
-        for(int i = 0; i < sphere_count; i++) {
-            if(spheres[i].hit(now_pos, now_ray, t, normal, inside))
-                hit_sphere = &spheres[i];
+        int type;
+        int index = -1;
+        for(int j = 0; j < sphere_count; j++) {
+            if(spheres[j].hit(now_pos, now_ray, t, normal, inside)){
+                index = j;
+                type = 0;
+            }
         }
-        if(hit_sphere == nullptr)
+        for(int j = 0; j < plane_count; j++) {
+            if(planes[j].hit(now_pos, now_ray, t, normal, inside)){
+                index = j;
+                type = 1;
+            }
+        }
+        if(index == -1)
             return col;
-        Sphere& s = *hit_sphere;
-        if(depth <= 0)
-            return col + ratio * s.emission;
-        now_pos = now_pos + now_ray * t + 0.03f * normal;
-        col += ratio * s.emission;
-        ratio *= s.brdf(state, now_ray, now_ray, normal, inside);
+        
+        now_pos = now_pos + now_ray * t;
+        if(type == 0){
+            col += ratio * spheres[index].emission;
+            if(depth <= 0)
+                break;
+            ratio *= spheres[index].brdf(state, now_ray, now_ray, normal, inside);
+        } else if(type == 1){
+            col += ratio * planes[index].emission;
+            if(depth <= 0)
+                break;
+            ratio *= planes[index].brdf(state, now_ray, now_ray, normal, inside);
+        }
+        now_pos += now_ray * 0.001f;
     }
     return col;
 }
@@ -325,19 +451,34 @@ void init_camera(){
  */
 void init_spheres(){
     Sphere spheres_host[] = {
-        Sphere(glm::vec3(1e5, 40.8, 81.6), 1e5, glm::vec3(0.75, 0.25, 0.25), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Left
-        Sphere(glm::vec3(-1e5 + 81.6, 40.8, 81.6), 1e5, glm::vec3(0.25, 0.25, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Right
-        Sphere(glm::vec3(40.8, 40.8, 1e5), 1e5, glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Back
-        Sphere(glm::vec3(40.8, 40.8, -1e5 + 163.2), 1e5, glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Front
-        Sphere(glm::vec3(40.8, 1e5, 81.6), 1e5, glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Bottom
-        Sphere(glm::vec3(40.8, -1e5 + 81.6, 81.6), 1e5, glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Top
-        Sphere(glm::vec3(27, 16, 48), 16, glm::vec3(1.0, 1.0, 1.0), 1.0, 0.8, glm::vec3(0.0, 0.0, 0.0)), // sphere1
-        Sphere(glm::vec3(56, 16, 74), 16, glm::vec3(0.10, 0.7, 0.10), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere2
-        Sphere(glm::vec3(40.8, 681.6 - 0.16, 81.6), 600, glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(24, 24, 24)) // Light
+        Sphere(glm::vec3(27, 16, 48), 16, glm::vec3(1.0, 1.0, 1.0), 1.0, 0.7, glm::vec3(0.0, 0.0, 0.0)), // sphere1
+        Sphere(glm::vec3(56, 16, 74), 16, glm::vec3(1.0, 1.0, 1.0), 0.04, 0.0, glm::vec3(0.0, 0.0, 0.0)), // sphere2
+        Sphere(glm::vec3(40.8, 681.6 - 0.16, 62), 600, glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(24, 24, 24)), // Light
+        Sphere(glm::vec3(12, 9, 88), 9, glm::vec3(0.25, 0.75, 0.25), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere3
+        Sphere(glm::vec3(42, 6, 104), 6, glm::vec3(0.75, 0.75, 0.25), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere4
     };
     int sphere_count_host = sizeof(spheres_host) / sizeof(Sphere);
     cudaMemcpyToSymbol(spheres, spheres_host, sizeof(spheres_host));
     cudaMemcpyToSymbol(sphere_count, &sphere_count_host, sizeof(int));
+}
+
+/**
+ * @brief init planes
+ */
+void init_planes(){
+    plane planes_host[] = {
+        plane(glm::vec3(0.0, 0.0, 0.0), glm::vec3(1.0, 0.0, 0.0), glm::vec3(0.75, 0.25, 0.25), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Left
+        plane(glm::vec3(81.6, 0.0, 0.0), glm::vec3(-1.0, 0.0, 0.0), glm::vec3(0.25, 0.25, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Right
+        plane(glm::vec3(40.8, 0.0, 0.0), glm::vec3(0.0, 0.0, 1.0), glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Back
+        plane(glm::vec3(0.0, 0.0, 163.2), glm::vec3(0.0, 0.0, -1.0), glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Front
+        plane(glm::vec3(0.0, 0.0, 0.0), glm::vec3(0.0, 1.0, 0.0), glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // Bottom
+        plane(glm::vec3(0.0, 81.6, 0.0), glm::vec3(0.0, -1.0, 0.0), glm::vec3(0.75, 0.75, 0.75), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // top
+        plane(glm::vec3(0.0, 14, 0.0), glm::vec3(0.0, 1.0, 0.0), glm::vec3(1.0, 1.0, 1.0), 0.02, 0.1, glm::vec3(0.0, 0.0, 0.0)), // water
+    };
+    planes_host[6].type = 1;// water has waves
+    int plane_count_host = sizeof(planes_host) / sizeof(plane);
+    cudaMemcpyToSymbol(planes, planes_host, sizeof(planes_host));
+    cudaMemcpyToSymbol(plane_count, &plane_count_host, sizeof(int));
 }
 
 int main() {
@@ -352,6 +493,7 @@ int main() {
 
     init_camera();
     init_spheres();
+    init_planes();
 
     // set up CUDA threads and blocks
     dim3 block_size(16, 16);
