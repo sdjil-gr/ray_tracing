@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <cmath>
+#include <time.h>
 
 #include <curand_kernel.h>
 
@@ -7,10 +8,10 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb/stb_image_write.h"
 
-#define IMAGE_WIDTH 960
-#define IMAGE_HEIGHT 960
-#define SAMP 32768
-#define SUBPIX 16
+#define IMAGE_WIDTH 1440
+#define IMAGE_HEIGHT 1440
+#define SAMP 16384
+#define SUBPIX 8
 #define MAX_DEPTH 16
 
 #define MAX_ITEM_COUNT 30
@@ -562,7 +563,7 @@ void init_camera(){
  */
 void init_spheres(){
     Sphere spheres_host[] = {
-        Sphere(glm::vec3(27, 16, 48), 16, glm::vec3(1.0, 1.0, 1.0), 1.0, 0.8, glm::vec3(0.0, 0.0, 0.0)), // sphere1
+        Sphere(glm::vec3(27, 16, 48), 16, glm::vec3(1.0, 1.0, 1.0), 1.0, 0.7, glm::vec3(0.0, 0.0, 0.0)), // sphere1
         Sphere(glm::vec3(56, 16, 74), 16, glm::vec3(1.0, 1.0, 1.0), 0.04, 0.0, glm::vec3(0.0, 0.0, 0.0)), // sphere2
         Sphere(glm::vec3(40.8, 681.6 - 0.16, 62), 600, glm::vec3(0.0, 0.0, 0.0), 1.0, 1.0, glm::vec3(24, 24, 24)), // Light
         Sphere(glm::vec3(12, 9, 88), 9, glm::vec3(0.25, 0.75, 0.25), 1.0, 1.0, glm::vec3(0.0, 0.0, 0.0)), // sphere3
@@ -597,8 +598,8 @@ void init_planes(){
  */
 void init_medium(){
     medium medium_host = medium(
-        0.8f, // s
-        0.006f // e
+        0.94f, // s
+        0.002f // e
     );
     CUDAErrorCheck(cudaMemcpyToSymbol(med, &medium_host, sizeof(medium)));
 }
@@ -632,12 +633,16 @@ int main() {
     float* image_f;
     CUDAErrorCheck(cudaMalloc(&image_f, width * height * 3 * sizeof(float)));
     CUDAErrorCheck(cudaMemset(image_f, 0, width * height * 3 * sizeof(float)));
+
+    int start_time = clock();
     for(int i = 0; i < samples_per_pixel; i++){
         render<<<grid_size, block_size>>>(states, image_f, width, height, samples_per_pixel);
-        if(i % 10 == 9){
-            fflush(stderr);
-            fprintf(stderr, "Rendering... %5.2f%%\r", (float)(i+1) / (float)samples_per_pixel * 100.0f);
-        }
+        int now_time = clock();
+        fflush(stderr);
+        int remain_sec = (int)((float)(samples_per_pixel - i - 1) * (float)(now_time - start_time) / (float)i / (float)CLOCKS_PER_SEC);
+        int remain_min = remain_sec / 60;
+        remain_sec %= 60;
+        fprintf(stderr, "Rendering... %5.2f%%, remain: %d m %d s                   \r", (float)(i+1) / (float)samples_per_pixel * 100.0f, remain_min, remain_sec);
         cudaDeviceSynchronize();
     }
     CUDAErrorCheck(cudaGetLastError());
@@ -674,9 +679,9 @@ int main() {
     CUDAErrorCheck(cudaEventSynchronize(stop));
     float milliseconds = 0;
     CUDAErrorCheck(cudaEventElapsedTime(&milliseconds, start, stop));
-    printf("Time: %.3f ms         \n", milliseconds);
+    printf("Time: %.3f ms                                                                           \n", milliseconds);
     CUDAErrorCheck(cudaEventDestroy(start));
-    CUDAErrorCheck(cudaEventDestroy(stop));
+    CUDAErrorCheck(cudaEventDestroy(stop)); 
 
     // save image to file
     stbi_write_png("image.png", width, height, 3, image_host, width * 3);
