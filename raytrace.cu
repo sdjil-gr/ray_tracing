@@ -445,13 +445,18 @@ __device__ glm::vec3 shade(curandStateXORWOW_t* state, const glm::vec3& pos, con
 /**
  * @brief init random states for threads
  * @param states - random states
+ * @param width - image width
+ * @param height - image height (for this strip)
+ * @param y_offset - vertical offset for this strip
  */
-__global__ void init_states(curandStateXORWOW_t* states) {
+__global__ void init_states(curandStateXORWOW_t* states, int width, int height, int y_offset) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int index = y * IMAGE_WIDTH + x;
-    if (x >= IMAGE_WIDTH || y >= IMAGE_HEIGHT) return;
-    curand_init(1234, index, 0, &states[index]);
+    if (x >= width || y >= height) return;
+    int index = y * width + x;
+    // Use y_offset to ensure different random sequences for different strips
+    int global_index = (y + y_offset) * width + x;
+    curand_init(1234, global_index, 0, &states[index]);
 }
 
 /**
@@ -459,10 +464,11 @@ __global__ void init_states(curandStateXORWOW_t* states) {
  * @param states - random states
  * @param image - output image
  * @param width - image width
- * @param height - image height
+ * @param height - image height (for this strip)
  * @param samples_per_pixel - number of samples per pixel
+ * @param y_offset - vertical offset for this strip
  */
-__global__ void render(curandStateXORWOW_t* states, float* image, int width, int height, int samples_per_pixel) {
+__global__ void render(curandStateXORWOW_t* states, float* image, int width, int height, int samples_per_pixel, int y_offset) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     int index = y * width + x;
@@ -477,7 +483,8 @@ __global__ void render(curandStateXORWOW_t* states, float* image, int width, int
         float theta = curand_uniform_double(&states[index]) * 2.0 * M_PI;
         assert(index < width * height);
         float r = curand_uniform_double(&states[index]);
-        glm::vec3 samp_ray = cam.get_ray(x + r * std::cos(theta), y + r * std::sin(theta));
+        // Add y_offset to get the correct global y coordinate
+        glm::vec3 samp_ray = cam.get_ray(x + r * std::cos(theta), y + y_offset + r * std::sin(theta));
         col += shade(&states[index], pos, samp_ray, MAX_DEPTH) / (float)samples_per_pixel / (float)SUBPIX;
     }
     image[index * 3 + 0] += col[0];
@@ -609,34 +616,111 @@ int main() {
     int height = IMAGE_HEIGHT;
     int samples_per_pixel = SAMP;
 
+    // Query available GPUs
+    int num_devices;
+    CUDAErrorCheck(cudaGetDeviceCount(&num_devices));
+    printf("Found %d CUDA device(s)\n", num_devices);
+    
+    if (num_devices == 0) {
+        fprintf(stderr, "No CUDA devices found!\n");
+        return 1;
+    }
+
     cudaEvent_t start, stop;
+    CUDAErrorCheck(cudaSetDevice(0));
     CUDAErrorCheck(cudaEventCreate(&start));
     CUDAErrorCheck(cudaEventCreate(&stop));
     CUDAErrorCheck(cudaEventRecord(start, 0));
 
-    init_camera();
-    init_spheres();
-    init_planes();
-    init_medium();
+    // Divide image into strips for each GPU
+    int* strip_heights = (int*)malloc(num_devices * sizeof(int));
+    int* strip_offsets = (int*)malloc(num_devices * sizeof(int));
+    if (strip_heights == NULL || strip_offsets == NULL) {
+        fprintf(stderr, "Failed to allocate memory for strip arrays\n");
+        free(strip_heights);
+        free(strip_offsets);
+        return 1;
+    }
+    
+    int base_height = height / num_devices;
+    int remainder = height % num_devices;
+    
+    for (int dev = 0; dev < num_devices; dev++) {
+        strip_heights[dev] = base_height + (dev < remainder ? 1 : 0);
+        strip_offsets[dev] = (dev == 0) ? 0 : strip_offsets[dev - 1] + strip_heights[dev - 1];
+    }
 
-    // set up CUDA threads and blocks
-    dim3 block_size(16, 16);
-    dim3 grid_size((width + 15) / 16, (height + 15)/ 16);
+    // Arrays to hold per-GPU data
+    curandStateXORWOW_t** states_array = (curandStateXORWOW_t**)malloc(num_devices * sizeof(curandStateXORWOW_t*));
+    float** image_f_array = (float**)malloc(num_devices * sizeof(float*));
+    cudaStream_t* streams = (cudaStream_t*)malloc(num_devices * sizeof(cudaStream_t));
+    if (states_array == NULL || image_f_array == NULL || streams == NULL) {
+        fprintf(stderr, "Failed to allocate memory for GPU resource arrays\n");
+        free(strip_heights);
+        free(strip_offsets);
+        free(states_array);
+        free(image_f_array);
+        free(streams);
+        return 1;
+    }
 
-    // init random states
-    curandStateXORWOW_t* states;
-    size_t size = width * height;
-    CUDAErrorCheck(cudaMalloc(&states, sizeof(curandStateXORWOW_t) * size));
-    init_states<<<grid_size, block_size>>>(states);
+    // Initialize each GPU
+    for (int dev = 0; dev < num_devices; dev++) {
+        CUDAErrorCheck(cudaSetDevice(dev));
+        
+        // Initialize scene data on each GPU
+        init_camera();
+        init_spheres();
+        init_planes();
+        init_medium();
 
-    // render
-    float* image_f;
-    CUDAErrorCheck(cudaMalloc(&image_f, width * height * 3 * sizeof(float)));
-    CUDAErrorCheck(cudaMemset(image_f, 0, width * height * 3 * sizeof(float)));
+        // Create stream for this device
+        CUDAErrorCheck(cudaStreamCreate(&streams[dev]));
 
+        // Set up CUDA threads and blocks for this strip
+        int strip_h = strip_heights[dev];
+        int y_off = strip_offsets[dev];
+        dim3 block_size(16, 16);
+        dim3 grid_size((width + 15) / 16, (strip_h + 15) / 16);
+
+        // Init random states for this strip
+        size_t size = width * strip_h;
+        CUDAErrorCheck(cudaMalloc(&states_array[dev], sizeof(curandStateXORWOW_t) * size));
+        init_states<<<grid_size, block_size, 0, streams[dev]>>>(states_array[dev], width, strip_h, y_off);
+
+        // Allocate image buffer for this strip
+        CUDAErrorCheck(cudaMalloc(&image_f_array[dev], width * strip_h * 3 * sizeof(float)));
+        CUDAErrorCheck(cudaMemset(image_f_array[dev], 0, width * strip_h * 3 * sizeof(float)));
+    }
+
+    // Synchronize all GPUs after initialization
+    for (int dev = 0; dev < num_devices; dev++) {
+        CUDAErrorCheck(cudaSetDevice(dev));
+        CUDAErrorCheck(cudaDeviceSynchronize());
+    }
+
+    // Render on all GPUs
     int start_time = clock();
     for(int i = 0; i < samples_per_pixel; i++){
-        render<<<grid_size, block_size>>>(states, image_f, width, height, samples_per_pixel);
+        // Launch render kernel on each GPU
+        for (int dev = 0; dev < num_devices; dev++) {
+            CUDAErrorCheck(cudaSetDevice(dev));
+            
+            int strip_h = strip_heights[dev];
+            int y_off = strip_offsets[dev];
+            dim3 block_size(16, 16);
+            dim3 grid_size((width + 15) / 16, (strip_h + 15) / 16);
+            
+            render<<<grid_size, block_size, 0, streams[dev]>>>(
+                states_array[dev], image_f_array[dev], width, strip_h, samples_per_pixel, y_off);
+        }
+
+        // Synchronize all GPUs
+        for (int dev = 0; dev < num_devices; dev++) {
+            CUDAErrorCheck(cudaSetDevice(dev));
+            CUDAErrorCheck(cudaStreamSynchronize(streams[dev]));
+        }
+
         int now_time = clock();
         fflush(stderr);
         int now_sec = (now_time - start_time) / CLOCKS_PER_SEC;
@@ -645,18 +729,80 @@ int main() {
         int remain_sec = (int)((float)(samples_per_pixel - i - 1) * (float)(now_time - start_time) / (float)i / (float)CLOCKS_PER_SEC);
         int remain_min = remain_sec / 60;
         remain_sec %= 60;
-        fprintf(stderr, "Rendering... %5.2f%%, now: %d m %d s, remain: %d m %d s                   \r", (float)(i+1) / (float)samples_per_pixel * 100.0f, now_min, now_sec, remain_min, remain_sec);
-        cudaDeviceSynchronize();
+        fprintf(stderr, "Rendering... %5.2f%%, now: %d m %d s, remain: %d m %d s (using %d GPU(s))                   \r", 
+                (float)(i+1) / (float)samples_per_pixel * 100.0f, now_min, now_sec, remain_min, remain_sec, num_devices);
     }
-    CUDAErrorCheck(cudaGetLastError());
+    
+    for (int dev = 0; dev < num_devices; dev++) {
+        CUDAErrorCheck(cudaSetDevice(dev));
+        CUDAErrorCheck(cudaGetLastError());
+    }
+
+    // Allocate host memory for the complete image
+    float* image_f_host = (float*)malloc(width * height * 3 * sizeof(float));
+    if (image_f_host == NULL) {
+        fprintf(stderr, "Failed to allocate host memory for image\n");
+        return 1;
+    }
+    
+    // Copy and combine results from all GPUs
+    for (int dev = 0; dev < num_devices; dev++) {
+        CUDAErrorCheck(cudaSetDevice(dev));
+        
+        int strip_h = strip_heights[dev];
+        int y_off = strip_offsets[dev];
+        
+        // Copy this strip to the appropriate location in host memory
+        float* strip_host = (float*)malloc(width * strip_h * 3 * sizeof(float));
+        if (strip_host == NULL) {
+            fprintf(stderr, "Failed to allocate host memory for image strip\n");
+            free(image_f_host);
+            return 1;
+        }
+        CUDAErrorCheck(cudaMemcpy(strip_host, image_f_array[dev], 
+                                   width * strip_h * 3 * sizeof(float), 
+                                   cudaMemcpyDeviceToHost));
+        
+        // Copy strip to the correct position in the full image
+        memcpy(image_f_host + y_off * width * 3, strip_host, width * strip_h * 3 * sizeof(float));
+        free(strip_host);
+    }
+
+    // Convert combined float image to uint8 on GPU 0
+    CUDAErrorCheck(cudaSetDevice(0));
+    
+    // Allocate device memory for full float image on GPU 0
+    float* image_f_full;
+    CUDAErrorCheck(cudaMalloc(&image_f_full, width * height * 3 * sizeof(float)));
+    CUDAErrorCheck(cudaMemcpy(image_f_full, image_f_host, width * height * 3 * sizeof(float), 
+                               cudaMemcpyHostToDevice));
+    free(image_f_host);
 
     // convert float(0.0~1.0) to uint8(0~255)
     unsigned char* image;
+    dim3 block_size(16, 16);
+    dim3 grid_size((width + 15) / 16, (height + 15) / 16);
     CUDAErrorCheck(cudaMalloc(&image, width * height * 3));
-    image_float2uint8<<<grid_size, block_size>>>(image, image_f, width, height);
+    image_float2uint8<<<grid_size, block_size>>>(image, image_f_full, width, height);
     cudaDeviceSynchronize();
     CUDAErrorCheck(cudaGetLastError());
-    cudaFree(image_f);
+    cudaFree(image_f_full);
+
+    // Clean up GPU resources
+    for (int dev = 0; dev < num_devices; dev++) {
+        CUDAErrorCheck(cudaSetDevice(dev));
+        CUDAErrorCheck(cudaFree(states_array[dev]));
+        CUDAErrorCheck(cudaFree(image_f_array[dev]));
+        CUDAErrorCheck(cudaStreamDestroy(streams[dev]));
+    }
+    free(states_array);
+    free(image_f_array);
+    free(streams);
+    free(strip_heights);
+    free(strip_offsets);
+
+    // Switch back to device 0 for final operations
+    CUDAErrorCheck(cudaSetDevice(0));
 
 #ifdef GENERATE_GAUSS_BLUR
     // blur image with gaussian kernel
