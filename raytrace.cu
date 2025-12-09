@@ -635,6 +635,12 @@ int main() {
     // Divide image into strips for each GPU
     int* strip_heights = (int*)malloc(num_devices * sizeof(int));
     int* strip_offsets = (int*)malloc(num_devices * sizeof(int));
+    if (strip_heights == NULL || strip_offsets == NULL) {
+        fprintf(stderr, "Failed to allocate memory for strip arrays\n");
+        free(strip_heights);
+        free(strip_offsets);
+        return 1;
+    }
     
     int base_height = height / num_devices;
     int remainder = height % num_devices;
@@ -648,6 +654,15 @@ int main() {
     curandStateXORWOW_t** states_array = (curandStateXORWOW_t**)malloc(num_devices * sizeof(curandStateXORWOW_t*));
     float** image_f_array = (float**)malloc(num_devices * sizeof(float*));
     cudaStream_t* streams = (cudaStream_t*)malloc(num_devices * sizeof(cudaStream_t));
+    if (states_array == NULL || image_f_array == NULL || streams == NULL) {
+        fprintf(stderr, "Failed to allocate memory for GPU resource arrays\n");
+        free(strip_heights);
+        free(strip_offsets);
+        free(states_array);
+        free(image_f_array);
+        free(streams);
+        return 1;
+    }
 
     // Initialize each GPU
     for (int dev = 0; dev < num_devices; dev++) {
@@ -722,6 +737,10 @@ int main() {
 
     // Allocate host memory for the complete image
     float* image_f_host = (float*)malloc(width * height * 3 * sizeof(float));
+    if (image_f_host == NULL) {
+        fprintf(stderr, "Failed to allocate host memory for image\n");
+        return 1;
+    }
     
     // Copy and combine results from all GPUs
     for (int dev = 0; dev < num_devices; dev++) {
@@ -732,6 +751,11 @@ int main() {
         
         // Copy this strip to the appropriate location in host memory
         float* strip_host = (float*)malloc(width * strip_h * 3 * sizeof(float));
+        if (strip_host == NULL) {
+            fprintf(stderr, "Failed to allocate host memory for image strip\n");
+            free(image_f_host);
+            return 1;
+        }
         CUDAErrorCheck(cudaMemcpy(strip_host, image_f_array[dev], 
                                    width * strip_h * 3 * sizeof(float), 
                                    cudaMemcpyDeviceToHost));
