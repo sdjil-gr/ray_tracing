@@ -639,10 +639,13 @@ int main() {
         render<<<grid_size, block_size>>>(states, image_f, width, height, samples_per_pixel);
         int now_time = clock();
         fflush(stderr);
+        int now_sec = (now_time - start_time) / CLOCKS_PER_SEC;
+        int now_min = now_sec / 60;
+        now_sec %= 60;
         int remain_sec = (int)((float)(samples_per_pixel - i - 1) * (float)(now_time - start_time) / (float)i / (float)CLOCKS_PER_SEC);
         int remain_min = remain_sec / 60;
         remain_sec %= 60;
-        fprintf(stderr, "Rendering... %5.2f%%, remain: %d m %d s                   \r", (float)(i+1) / (float)samples_per_pixel * 100.0f, remain_min, remain_sec);
+        fprintf(stderr, "Rendering... %5.2f%%, now: %d m %d s, remain: %d m %d s                   \r", (float)(i+1) / (float)samples_per_pixel * 100.0f, now_min, now_sec, remain_min, remain_sec);
         cudaDeviceSynchronize();
     }
     CUDAErrorCheck(cudaGetLastError());
